@@ -119,12 +119,14 @@ class JsonApplication:
                 return Response(200, {"job": result})
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "complete":
                 result = self.service.complete_job(
-                    payload["worker_id"], int(parts[1]), self._actor(normalized_headers)
+                    payload["worker_id"], int(parts[1]), self._actor(normalized_headers),
+                    int(payload["claim_generation"]),
                 )
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "fail":
                 result = self.service.fail_job(
-                    payload["worker_id"], int(parts[1]), payload["error"], int(payload.get("retry_seconds", 0))
+                    payload["worker_id"], int(parts[1]), payload["error"],
+                    int(payload["claim_generation"]), int(payload.get("retry_seconds", 0)),
                 )
                 return Response(200, result)
             if method == "POST" and path == "/decisions":

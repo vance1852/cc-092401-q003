@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -117,6 +117,10 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     available_at TEXT NOT NULL,
     lease_owner TEXT,
     lease_expires_at TEXT,
+    -- 领取代次：每次领取（含过期接管）自增，是区分每次持有的 fencing token；
+    -- complete/fail 必须凭领取时拿到的代次写回。
+    claim_generation INTEGER NOT NULL DEFAULT 0 CHECK (claim_generation >= 0),
+    claimed_at TEXT,
     last_error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -190,11 +194,37 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+_MIGRATIONS = (
+    # version 2 -> 3: 为分析任务引入领取代次（fencing token）。
+    (
+        3,
+        (
+            "ALTER TABLE analysis_jobs ADD COLUMN claim_generation INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (claim_generation >= 0)",
+            "ALTER TABLE analysis_jobs ADD COLUMN claimed_at TEXT",
+        ),
+    ),
+)
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
     with transaction(connection, immediate=True):
+        row = connection.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()
+        if row is None:
+            # 全新数据库：SCHEMA_SQL 建出的就是最新结构，无需迁移。
+            current = SCHEMA_VERSION
+        else:
+            current = int(row["value"])
+            for target, statements in _MIGRATIONS:
+                if current < target:
+                    for statement in statements:
+                        connection.execute(statement)
+                    current = target
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
