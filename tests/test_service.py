@@ -48,7 +48,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(imported["inserted"], 6)
         self.service.seal_batch("stat", "batch-a", 2)
         job = self.service.claim_job("worker", 30)
-        analysis = self.service.complete_job("worker", job["job_id"], "stat")
+        analysis = self.service.complete_job("worker", job["job_id"], "stat", job["lease_generation"])
         self.service.decide("approver", "batch-a", analysis["analysis_id"], "approved", "满足规则")
         report = self.service.report("auditor", "batch-a")
         self.assertEqual(report["batch"]["state"], "decided")
@@ -100,7 +100,10 @@ class ServiceTests(unittest.TestCase):
         self.service.import_observations("operator", "batch-a", "key-1", self.rows)
         self.service.seal_batch("stat", "batch-a", 2)
         job = self.service.claim_job("worker-a", 10)
-        failed = self.service.fail_job("worker-a", job["job_id"], "临时计算失败", retry_seconds=5)
+        failed = self.service.fail_job(
+            "worker-a", job["job_id"], "临时计算失败", retry_seconds=5,
+            lease_generation=job["lease_generation"],
+        )
         self.assertEqual(failed["state"], "queued")
         self.assertIsNone(self.service.claim_job("worker-b", 10))
         self.clock.advance(seconds=5)
@@ -116,8 +119,9 @@ class ServiceTests(unittest.TestCase):
         second = self.service.claim_job("worker-b", 10)
         self.assertEqual(first["job_id"], second["job_id"])
         self.assertEqual(second["lease_owner"], "worker-b")
+        self.assertGreater(second["lease_generation"], first["lease_generation"])
         with self.assertRaises(InvalidState):
-            self.service.complete_job("worker-a", first["job_id"], "stat")
+            self.service.complete_job("worker-a", first["job_id"], "stat", first["lease_generation"])
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS batches (
     created_at TEXT NOT NULL,
     started_at TEXT,
     sealed_at TEXT,
+    -- 完成该批次分析的领取代次（fencing token），与 analysis_jobs.lease_generation 配合，
+    -- 确保只有仍然持有租约的那次领取才能把批次推进到 analyzed。
+    completed_by_job_generation INTEGER,
     FOREIGN KEY (protocol_id, protocol_version) REFERENCES protocol_catalog(protocol_id, version)
 );
 
@@ -117,10 +120,23 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     available_at TEXT NOT NULL,
     lease_owner TEXT,
     lease_expires_at TEXT,
+    lease_generation INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (batch_id, batch_revision)
+);
+
+-- 每次领取（含过期接管）都会让 lease_generation 单调递增；完成路径必须
+-- 出示与当前代次一致的持有凭证，并在写事务内重新校验，形成 fencing token。
+CREATE TABLE IF NOT EXISTS job_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL REFERENCES analysis_jobs(job_id),
+    event_type TEXT NOT NULL CHECK (event_type IN ('claimed', 'succeeded', 'complete_rejected')),
+    worker_id TEXT NOT NULL,
+    lease_generation INTEGER,
+    reason TEXT,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS analyses (
@@ -162,7 +178,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
 REQUIRED_TABLES = frozenset({
     "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
     "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
-    "analyses", "decisions", "audit_events",
+    "job_events", "analyses", "decisions", "audit_events",
 })
 
 
@@ -190,9 +206,33 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """对已存在的旧版数据库做就地、幂等的结构升级。"""
+
+    if "analysis_jobs" in {row[0] for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}:
+        columns = _column_names(connection, "analysis_jobs")
+        if "lease_generation" not in columns:
+            connection.execute(
+                "ALTER TABLE analysis_jobs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0"
+            )
+    if "batches" in {row[0] for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}:
+        columns = _column_names(connection, "batches")
+        if "completed_by_job_generation" not in columns:
+            connection.execute("ALTER TABLE batches ADD COLUMN completed_by_job_generation INTEGER")
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
+    _migrate(connection)
     connection.executescript(SCHEMA_SQL)
     with transaction(connection, immediate=True):
         connection.execute(
